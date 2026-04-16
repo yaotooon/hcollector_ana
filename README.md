@@ -1,215 +1,173 @@
-# Hcollector 性能分析平台 — 部署文档
+# perf-analyzer
 
-## 项目结构
+基于 Web 的 HPC 性能日志分析工具。上传 hcollector 采集的 runlog 压缩包，自动解析并可视化 CPU、内存、IO、网络、调度等多维度性能数据，并根据可配置规则输出优化建议。
 
-```
-perf-analyzer/
-├── app.py              # FastAPI 后端（解析器 + API）
-├── static/
-│   └── index.html      # 前端单页应用
-└── DEPLOY.md           # 本文档
-```
+## 功能
 
-## 环境要求
+### 分析模块
 
-| 依赖 | 最低版本 | 说明 |
+| 模块 | 来源文件 | 内容 |
 |------|---------|------|
-| Python | 3.9+ | 标准库已包含 zipfile / tarfile |
-| fastapi | 0.100+ | Web 框架 |
-| uvicorn | 0.20+ | ASGI 服务器 |
-| python-multipart | 0.0.6+ | 文件上传支持 |
+| 基础信息 | `base*.log` | CPU 型号、核数、NUMA 拓扑、内核版本、内存 |
+| CPU 微架构 | `hpt-uarch.log` | IPC、频率、L1/L2/L3 缺失率、分支预测 |
+| TopDown | `hpt-topdown.log` | Frontend/Backend Bound、Bad Speculation 详细分解 |
+| 缓存 & 带宽 | `hpt-cm.log` | 各 Die/Socket 内存带宽 |
+| 热点函数 | `hpt-hotspot.log` | perf 多事件热点函数排名 |
+| 火焰图 | `hpt-hotspot-flame*.svg` | CPU 火焰图（交互式 SVG） |
+| NUMA | `hpt-mem.log` | 进程远程/本地内存访问比 |
+| 调度 | `hpt-sched.log` | CPU/Die 迁移次数、调度延迟 |
+| CPU 利用率 | `mpstat.log` | 时序 CPU 利用率（usr/sys/iowait） |
+| 磁盘 IO | `iostat.log` / `di*.log` | IOPS、吞吐量、await 时序 |
+| IO 内存 | `iom*.log` | IO 内存使用 |
+| 网络 | `sar_net*.log` / `nethogs*.log` / `eths*.log` | 网络吞吐、进程级流量 |
+| 进程 Top | `top*.log` | 系统进程资源快照 |
+| Turbostat | `turbostat*.log` | 频率、C-State、功耗 |
+| NUMA 绑定 | `numactl*.log` | 进程 NUMA 策略 |
+| 硬件信息 | `lspci*.log` | PCIe 设备列表 |
+| IPMI | `ipmi*.log` | 温度、风扇、电源传感器 |
+| 容器 | `container*.log` | Docker/Podman 容器信息 |
+| 虚拟化 | `virt*.log` / `qemu*.log` | QEMU/KVM 虚拟机配置 |
+| 线程调度 | `process_sched*.log` | 线程级调度统计 |
+| CPU 亲和性 | `proc_affinity*.log` | 进程 CPU 绑定情况 |
+| 线程运行时 | `thread_runtime*.log` | 线程运行时间分布 |
+| 符号表 | `kallsyms` | 内核符号解析 |
 
-> 已在 Python 3.14.3 + FastAPI 0.135.1 + uvicorn 0.41.0 环境下验证。
+### 规则引擎
 
----
+内置可配置的性能诊断规则，分析完成后自动生成 **高 / 中 / 低** 三级优化建议。规则支持多条件组合（AND/OR），可通过 Web UI 增删改查，并支持多规则集管理（密码保护）。
 
-## 快速启动
+## 快速开始
 
-### 1. 安装依赖
+### 安装依赖
 
 ```bash
 pip install fastapi uvicorn python-multipart
 ```
 
-> 若系统 Python 被保护（PEP 668），加 `--break-system-packages` 或使用虚拟环境：
+> 若系统 Python 受 PEP 668 保护，改用虚拟环境：
 > ```bash
 > python3 -m venv .venv && source .venv/bin/activate
 > pip install fastapi uvicorn python-multipart
 > ```
 
-### 2. 启动服务
+### 启动服务
 
 ```bash
-cd perf-analyzer
 python3 -m uvicorn app:app --host 0.0.0.0 --port 8766
 ```
 
-### 3. 访问
+打开浏览器访问 `http://localhost:8766`，上传 runlog 压缩包即可。
 
-打开浏览器访问：`http://localhost:8766`
+### 支持的压缩格式
 
----
+`.zip` · `.tar.gz` / `.tgz` · `.tar.bz2` · `.tar.xz` · `.tar`
+
+文件缺失时对应模块显示"无数据"，不影响其他模块。
 
 ## 生产部署
 
-### 方式一：多进程（推荐）
+### 多进程
 
 ```bash
-python3 -m uvicorn app:app \
-  --host 0.0.0.0 \
-  --port 8766 \
-  --workers 4 \
-  --access-log
+python3 -m uvicorn app:app --host 0.0.0.0 --port 8766 --workers 4
 ```
 
-> `--workers` 建议设为 CPU 核心数，每个 worker 独立处理一个上传请求。
-
-### 方式二：守护进程（nohup）
+### 守护进程
 
 ```bash
 nohup python3 -m uvicorn app:app \
-  --host 0.0.0.0 --port 8766 --workers 64 \
+  --host 0.0.0.0 --port 8766 --workers 4 \
   > /var/log/perf-analyzer.log 2>&1 &
-
 echo $! > /var/run/perf-analyzer.pid
 ```
 
-停止服务：
-```bash
-kill $(cat /var/run/perf-analyzer.pid)
-```
+### systemd
 
-### 方式三：systemd 服务（Linux）
-
-创建服务文件 `/etc/systemd/system/perf-analyzer.service`：
+创建 `/etc/systemd/system/perf-analyzer.service`：
 
 ```ini
 [Unit]
-Description=Hcollector 性能分析平台
+Description=perf-analyzer
 After=network.target
 
 [Service]
 Type=simple
-User=www-data
 WorkingDirectory=/opt/perf-analyzer
 ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8766 --workers 4
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-启用并启动：
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable perf-analyzer
-sudo systemctl start perf-analyzer
-sudo systemctl status perf-analyzer
+sudo systemctl enable --now perf-analyzer
 ```
 
-### 方式四：Nginx 反向代理
-
-`/etc/nginx/conf.d/perf-analyzer.conf`：
+### Nginx 反向代理
 
 ```nginx
 server {
     listen 80;
     server_name perf.example.com;
-
-    # 上传文件大小限制（runlog 包通常 5~50 MB）
     client_max_body_size 200m;
 
     location / {
         proxy_pass http://127.0.0.1:8766;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        # 大文件上传超时设置
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
     }
 }
 ```
 
-重载 Nginx：
-```bash
-sudo nginx -t && sudo systemctl reload nginx
+## API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/analyze` | 上传压缩包，返回全量解析结果（JSON） |
+| `GET` | `/api/rules` | 获取当前规则列表 |
+| `POST` | `/api/rules` | 保存规则列表 |
+| `POST` | `/api/rules/reset` | 恢复默认规则 |
+| `GET` | `/api/rulesets` | 获取所有规则集 |
+| `POST` | `/api/rulesets` | 创建规则集 |
+| `DELETE` | `/api/rulesets/{name}` | 删除规则集 |
+| `POST` | `/api/recommendations` | 对已解析结果单独执行规则推断 |
+
+## 项目结构
+
+```
+perf-analyzer/
+├── app.py              # FastAPI 后端（解析器 + API）
+├── rules.json          # 当前活跃规则
+├── rules/              # 多规则集目录
+├── static/
+│   ├── index.html      # 前端单页应用
+│   └── rules.html      # 规则编辑页
+└── README.md
 ```
 
----
+## 环境要求
 
-## 支持的压缩格式
+| 依赖 | 版本 |
+|------|------|
+| Python | 3.9+ |
+| fastapi | 0.100+ |
+| uvicorn | 0.20+ |
+| python-multipart | 0.0.6+ |
 
-上传文件时，后端按以下顺序自动检测格式，**无需用户指定**：
-
-| 扩展名 | 格式 | 备注 |
-|--------|------|------|
-| `.zip` | ZIP | 优先尝试 |
-| `.tar.gz` / `.tgz` | gzip 压缩 tar | |
-| `.tar.bz2` | bzip2 压缩 tar | |
-| `.tar.xz` | xz 压缩 tar | |
-| `.tar` | 无压缩 tar | |
-
----
-
-## 解析的日志文件
-
-服务从压缩包中按文件名查找以下文件（不依赖目录结构）：
-
-| 文件名 | 内容 | 对应 Tab |
-|--------|------|---------|
-| `hpt-uarch.log` | IPC、频率、L1/L2/L3缓存缺失率、TopDown | CPU / 缓存 |
-| `hpt-topdown.log` | TopDown 详细分解 | CPU |
-| `hpt-cm.log` | 各 Die/Socket 内存带宽 | 缓存 & 带宽 |
-| `hpt-hotspot.log` | perf 热点函数（多事件） | 热点函数 |
-| `hpt-mem.log` | 进程远程/本地内存访问比 | NUMA |
-| `hpt-sched.log` | 进程调度、CPU/Die 迁移 | 调度 |
-| `mpstat.log` | CPU 利用率时序 | CPU |
-| `version.log` | 采集工具版本号 | 顶栏显示 |
-| `hpt-hotspot-flame*.svg` | CPU 火焰图 | 火焰图 |
-
-> 文件缺失时对应模块显示"无数据"，不影响其他模块。
-
----
+已在 Python 3.14 + FastAPI 0.135 + uvicorn 0.41 下验证。
 
 ## 性能参考
 
-基于 `runlog-system-20260310-094235.tar`（7.3 MB）测试：
+测试文件：`runlog-system-20260310-094235.tar`（7.3 MB）
 
 | 指标 | 数值 |
 |------|------|
 | 文件读取 + 解压 | ~10 ms |
-| 全部解析器运行 | ~60 ms |
-| 总响应时间 | **~71 ms** |
+| 全部解析器 | ~60 ms |
+| 总响应时间 | ~71 ms |
 | 响应体大小 | ~530 KB |
-
-单机单进程可支撑并发分析，多 worker 可线性扩展。
-
----
-
-## 常见问题
-
-**Q: 上传后页面无反应**
-检查浏览器 Console（F12）是否有 JS 错误；确认服务端口未被防火墙拦截。
-
-**Q: 火焰图显示空白**
-压缩包中需包含 `*.svg` 文件（如 `hpt-hotspot-flame.svg`）。
-
-**Q: 部分指标显示 N/A**
-对应日志文件在压缩包中缺失，属正常情况，不影响其他项。
-
-**Q: 端口 8766 被占用**
-```bash
-lsof -ti :8766 | xargs kill
-# 或换端口
-python3 -m uvicorn app:app --port 9000
-```
-
-**Q: pip 安装报 PEP 668 错误**
-```bash
-pip install fastapi uvicorn python-multipart --break-system-packages
-# 或使用虚拟环境（推荐）
-python3 -m venv .venv && source .venv/bin/activate && pip install fastapi uvicorn python-multipart
-```
